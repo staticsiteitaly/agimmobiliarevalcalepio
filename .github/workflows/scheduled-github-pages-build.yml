@@ -1,0 +1,207 @@
+name: Deploy Jekyll with GitHub Pages dependencies preinstalled
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 12,19 * 11,12,1,2,3 *"
+    - cron: "0 11,18 * 4,5,6,7,8,9,10 *"
+    - cron: "0 23 30 12 *"
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Restore cached properties data
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            _data/properties-api.json
+            _assets/img/properties
+          key: properties-${{ github.run_id }}
+          restore-keys: |
+            properties-
+      - name: Cleanup old caches
+        run: |
+          gh cache list --key properties- --json id --jq '.[].id' | xargs -r -n1 gh cache delete
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Scrape properties and generate JSON
+        run: |
+          mkdir -p _assets/img/properties
+          mkdir -p _data
+          pip install Pillow --break-system-packages --quiet
+          curl -s -L --compressed \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36" \
+            -H "Accept-Language: it-IT,it;q=0.9" \
+            "https://www.agenziavalcalepio.it/" > /tmp/page.html
+          python3 << 'EOF'
+          import re
+          import json
+          import os
+          import sys
+          import time
+          import io
+          import shutil
+          import urllib.request
+          from PIL import Image
+          def set_cache_flag(value):
+              gh_env = os.environ.get("GITHUB_ENV")
+              if gh_env:
+                  with open(gh_env, "a") as f:
+                      f.write(f"SHOULD_SAVE_CACHE={value}\n")
+          with open("/tmp/page.html", "r", encoding="utf-8", errors="replace") as f:
+              html = f.read()
+          print(f"[INFO] Page loaded ({len(html)} chars)", file=sys.stderr)
+          def parse(html):
+              blocks = re.split(r'<div class="dispbox">', html)[1:]
+              def safe_int(lst, idx):
+                  try: return int(lst[idx])
+                  except: return 0
+              data = []
+              for i, block in enumerate(blocks):
+                  try:
+                      a = re.search(r'<a href="([^"]+)">([^<]+)<br>\s*([^<]+)</a>', block)
+                      if not a:
+                          print(f"[WARN] Block {i}: no link found", file=sys.stderr)
+                          continue
+                      page_url = a.group(1).replace("https://www.", "https://")
+                      title    = a.group(2).strip()
+                      city     = a.group(3).strip()
+                      sub = re.search(r'<div class="disp-sub">([^<]*)</div>', block)
+                      zone = sub.group(1).strip() if sub else ""
+                      img = re.search(r'<img class="homere" src="([^"]+)"', block)
+                      img_url = img.group(1) if img else None
+                      foot = re.search(r'<div class="disp-foot">(.*?)</div>', block, re.DOTALL)
+                      price = None
+                      if foot:
+                          price_m = re.search(r'([\d\.\,]+\s*\u20ac)', foot.group(1))
+                          price = price_m.group(1).strip() if price_m else None
+                      nums = re.findall(r'<b>(\d+)</b>', block)
+                      bed  = safe_int(nums, 0)
+                      bath = safe_int(nums, 1)
+                      sqm  = safe_int(nums, 2)
+                      data.append({
+                          "title": title,
+                          "city":  city,
+                          "zone":  zone,
+                          "url":   page_url,
+                          "image": img_url,
+                          "price": price,
+                          "bed":   f"{bed} {'camera' if bed == 1 else 'camere'}" if bed else "n/d",
+                          "bath":  f"{bath} {'bagno' if bath == 1 else 'bagni'}" if bath else "n/d",
+                          "sqm":   f"{sqm} m\u00b2" if sqm else "n/d",
+                      })
+                  except Exception as e:
+                      print(f"[ERROR] Block {i}: {e}", file=sys.stderr)
+              return data
+          def keep_existing(reason):
+              print(f"[WARN] {reason} Keeping existing data.", file=sys.stderr)
+              set_cache_flag("false")
+              sys.exit(0)
+          def download_images(data):
+              shutil.rmtree("_assets/img/properties", ignore_errors=True)
+              os.makedirs("_assets/img/properties", exist_ok=True)
+              headers = {
+                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+                  "Accept-Language": "it-IT,it;q=0.9",
+                  "Referer": "https://www.agenziavalcalepio.it/",
+              }
+              for item in data:
+                  src = item["image"]
+                  if not src:
+                      continue
+                  try:
+                      filename = src.split("/")[-1].split("?")[0]
+                      local_path = f"_assets/img/properties/{filename}"
+                      req = urllib.request.Request(src, headers=headers)
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          img_data = r.read()
+                      img = Image.open(io.BytesIO(img_data)).convert("RGB")
+                      ratio = max(600 / img.width, 600 / img.height)
+                      new_w = int(img.width * ratio)
+                      new_h = int(img.height * ratio)
+                      img = img.resize((new_w, new_h), Image.LANCZOS)
+                      left = (new_w - 600) // 2
+                      top = (new_h - 600) // 2
+                      img = img.crop((left, top, left + 600, top + 600))
+                      img.save(local_path, "JPEG", quality=85)
+                      item["image"] = f"/assets/img/properties/{filename}"
+                      print(f"[INFO] Downloaded {filename}", file=sys.stderr)
+                  except Exception as e:
+                      print(f"[WARN] Image download failed for {src}: {e}", file=sys.stderr)
+                      item["image"] = None
+          data1 = parse(html)
+          print(f"[INFO] First parse: {len(data1)} properties", file=sys.stderr)
+          if len(data1) < 3:
+              keep_existing(f"Too few properties ({len(data1)}).")
+          time.sleep(15)
+          with open("/tmp/page.html", "r", encoding="utf-8", errors="replace") as f:
+              html2 = f.read()
+          data2 = parse(html2)
+          urls1 = {p["url"] for p in data1}
+          urls2 = {p["url"] for p in data2}
+          overlap = len(urls1 & urls2) / max(len(urls1), len(urls2))
+          print(f"[INFO] Overlap between parses: {overlap:.0%}", file=sys.stderr)
+          data = data2
+          old_path = "_data/properties-api.json"
+          if os.path.exists(old_path):
+              try:
+                  with open(old_path, "r", encoding="utf-8") as f:
+                      old_data = json.load(f)
+                  old_urls = {p["url"] for p in old_data}
+                  new_urls = {p["url"] for p in data}
+                  old_overlap = len(old_urls & new_urls) / len(old_urls) if old_urls else 1.0
+                  print(f"[INFO] Overlap with cached JSON: {old_overlap:.0%}", file=sys.stderr)
+                  if old_overlap < 0.5:
+                      keep_existing(f"New data shares only {old_overlap:.0%} URLs with cached JSON.")
+              except Exception as e:
+                  print(f"[WARN] Could not compare with cached JSON: {e}", file=sys.stderr)
+          download_images(data)
+          with open(old_path, "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print(f"[OK] _data/properties-api.json written ({len(data)} properties).", file=sys.stderr)
+          set_cache_flag("true")
+          EOF
+      - name: Save properties cache
+        if: env.SHOULD_SAVE_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            _data/properties-api.json
+            _assets/img/properties
+          key: properties-${{ github.run_id }}
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./
+          destination: ./_site
+      - name: Copy assets into _site
+        run: |
+          sudo mkdir -p _site/assets
+          [ -d "_assets" ] && sudo cp -r _assets/. _site/assets/ || true
+          [ -d "public" ] && sudo cp -r public/. _site/ || true
+          sudo chown -R "$USER":"$USER" _site/
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
