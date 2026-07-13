@@ -1,0 +1,316 @@
+name: Deploy Jekyll with GitHub Pages dependencies preinstalled
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 12,19 * 11,12,1,2,3 *"
+    - cron: "0 11,18 * 4,5,6,7,8,9,10 *"
+    - cron: "0 23 30 12 *"
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.scrape.outputs.should_build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Restore cached properties data
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            _data/properties-api.json
+            _assets/img/properties
+          key: properties-${{ github.run_id }}
+          restore-keys: |
+            properties-
+      - name: Set week key
+        run: echo "WEEK=$(date +%Y-%W)" >> $GITHUB_ENV
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ env.WEEK }}
+      - name: Scrape properties and generate JSON
+        id: scrape
+        run: |
+          mkdir -p _assets/img/properties
+          mkdir -p _data
+          pip install Pillow requests beautifulsoup4 --break-system-packages --quiet
+          python3 << 'EOF'
+          import re
+          import json
+          import os
+          import sys
+          import time
+          import io
+          import shutil
+          import hashlib
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          CORRUPTION_PATTERN = re.compile(r'[a-zA-Z\u00e0-\u00fc\u00c0-\u00dc][\?%][a-zA-Z\u00e0-\u00fc\u00c0-\u00dc]')
+          PAGE_HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+              "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+              "Accept-Encoding": "gzip, deflate, zstd",
+              "Connection": "keep-alive",
+              "Upgrade-Insecure-Requests": "1",
+              "Sec-Fetch-Dest": "document",
+              "Sec-Fetch-Mode": "navigate",
+              "Sec-Fetch-Site": "none",
+              "Sec-Fetch-User": "?1",
+              "Cache-Control": "no-cache",
+              "Pragma": "no-cache",
+              "Priority": "u=0, i",
+              "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+              "sec-ch-ua-mobile": "?1",
+              "sec-ch-ua-platform": '"Android"',
+          }
+          IMAGE_HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+              "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+              "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+              "Accept-Encoding": "gzip, deflate, br",
+              "Referer": "https://www.agenziavalcalepio.it/",
+              "Connection": "keep-alive",
+              "Sec-Fetch-Dest": "image",
+              "Sec-Fetch-Mode": "no-cors",
+              "Sec-Fetch-Site": "same-origin",
+          }
+          def set_env(name, value):
+              path = os.environ.get("GITHUB_ENV")
+              if path:
+                  with open(path, "a") as f:
+                      f.write(f"{name}={value}\n")
+          def set_output(name, value):
+              path = os.environ.get("GITHUB_OUTPUT")
+              if path:
+                  with open(path, "a") as f:
+                      f.write(f"{name}={value}\n")
+          def abort(reason):
+              print(f"[WARN] {reason} Jekyll will build with existing data (if any).", file=sys.stderr)
+              set_env("SHOULD_SAVE_CACHE", "false")
+              set_env("SHOULD_BUILD", "true")
+              set_output("should_build", "true")
+              sys.exit(0)
+          def data_hash(data):
+              return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+          def has_corruption(data):
+              for item in data:
+                  for field in ("title", "city", "zone"):
+                      if CORRUPTION_PATTERN.search(item.get(field, "") or ""):
+                          return True
+              return False
+          def has_missing_fields(data):
+              for item in data:
+                  if not item.get("title") or not item.get("city") or not item.get("url"):
+                      return True
+              return False
+          def fetch_html():
+              url = "https://www.agenziavalcalepio.it/"
+              session = requests.Session()
+              session.headers.update(PAGE_HEADERS)
+              for attempt in range(1, 4):
+                  try:
+                      session.get(url, timeout=15)
+                      time.sleep(1)
+                      r = session.get(url, timeout=15)
+                      r.raise_for_status()
+                      encoding = r.headers.get("Content-Encoding", "identity")
+                      print(f"[INFO] Page fetched (attempt {attempt}, encoding={encoding}, chars={len(r.text)})", file=sys.stderr)
+                      return r.text
+                  except Exception as e:
+                      print(f"[WARN] Attempt {attempt} failed: {e}", file=sys.stderr)
+                      if attempt < 3:
+                          time.sleep(attempt * 5)
+              return None
+          def parse(html):
+              soup = BeautifulSoup(html, "html.parser")
+              data = []
+              for box in soup.find_all("div", class_="dispbox"):
+                  try:
+                      img_tag = box.find("img", class_="homere")
+                      img_url = img_tag["src"] if img_tag else None
+                      tit_div = box.find("div", class_="disp-tit")
+                      if not tit_div:
+                          continue
+                      a_tag = tit_div.find("a")
+                      if not a_tag:
+                          continue
+                      page_url = a_tag["href"].replace("https://www.", "https://")
+                      contents = list(a_tag.children)
+                      title = contents[0].strip() if contents else ""
+                      city = contents[-1].strip() if len(contents) > 1 else ""
+                      sub_div = box.find("div", class_="disp-sub")
+                      zone = sub_div.get_text(strip=True) if sub_div else ""
+                      dat_div = box.find("div", class_="disp-dat")
+                      bolds = [int(b.get_text(strip=True)) for b in dat_div.find_all("b") if b.get_text(strip=True).isdigit()] if dat_div else []
+                      def safe(idx): return bolds[idx] if idx < len(bolds) else 0
+                      bed  = safe(0)
+                      bath = safe(1)
+                      sqm  = safe(2)
+                      foot_div = box.find("div", class_="disp-foot")
+                      price = None
+                      if foot_div:
+                          price_m = re.search(r'([\d\.\,]+\s*\u20ac)', foot_div.get_text())
+                          price = price_m.group(1).strip() if price_m else None
+                      data.append({
+                          "title": title,
+                          "city":  city,
+                          "zone":  zone,
+                          "url":   page_url,
+                          "image": img_url,
+                          "price": price,
+                          "bed":   f"{bed} {'camera' if bed == 1 else 'camere'}" if bed else "n/d",
+                          "bath":  f"{bath} {'bagno' if bath == 1 else 'bagni'}" if bath else "n/d",
+                          "sqm":   f"{sqm} m\u00b2" if sqm else "n/d",
+                      })
+                  except Exception as e:
+                      print(f"[ERROR] Block parse error: {e}", file=sys.stderr)
+              return data
+          def normalize_image_paths(data):
+              for item in data:
+                  src = item.get("image")
+                  if src and src.startswith("http"):
+                      filename = src.split("/")[-1].split("?")[0]
+                      item["image"] = f"/assets/img/properties/{filename}"
+          def download_images(data):
+              shutil.rmtree("_assets/img/properties", ignore_errors=True)
+              os.makedirs("_assets/img/properties", exist_ok=True)
+              for item in data:
+                  src = item.get("_src_url")
+                  if not src:
+                      continue
+                  try:
+                      filename = item["image"].split("/")[-1]
+                      local_path = f"_assets/img/properties/{filename}"
+                      r = requests.get(src, headers=IMAGE_HEADERS, timeout=15)
+                      r.raise_for_status()
+                      img = Image.open(io.BytesIO(r.content)).convert("RGB")
+                      ratio = max(600 / img.width, 600 / img.height)
+                      new_w = int(img.width * ratio)
+                      new_h = int(img.height * ratio)
+                      img = img.resize((new_w, new_h), Image.LANCZOS)
+                      left = (new_w - 600) // 2
+                      top = (new_h - 600) // 2
+                      img = img.crop((left, top, left + 600, top + 600))
+                      img.save(local_path, "JPEG", quality=85)
+                      print(f"[INFO] Downloaded {filename}", file=sys.stderr)
+                  except Exception as e:
+                      print(f"[WARN] Image download failed for {src}: {e}", file=sys.stderr)
+                      item["image"] = None
+          old_path = "_data/properties-api.json"
+          old_data = None
+          old_data_clean = False
+          if os.path.exists(old_path):
+              try:
+                  with open(old_path, "r", encoding="utf-8") as f:
+                      old_data = json.load(f)
+                  if has_corruption(old_data):
+                      print("[WARN] Cached JSON is corrupted. Removing it.", file=sys.stderr)
+                      os.remove(old_path)
+                      old_data = None
+                  else:
+                      old_data_clean = True
+                      print(f"[INFO] Cached JSON is clean ({len(old_data)} properties).", file=sys.stderr)
+              except Exception as e:
+                  print(f"[WARN] Could not read cached JSON: {e}", file=sys.stderr)
+          html = fetch_html()
+          if html is None:
+              abort("Fetch failed.")
+          data = parse(html)
+          print(f"[INFO] Properties parsed: {len(data)}", file=sys.stderr)
+          if len(data) < 3:
+              abort(f"Too few properties ({len(data)}).")
+          if has_corruption(data):
+              abort("Corrupted text detected.")
+          if has_missing_fields(data):
+              abort("Missing required fields.")
+          for item in data:
+              item["_src_url"] = item["image"]
+          normalize_image_paths(data)
+          if old_data_clean:
+              old_urls = {p["url"] for p in old_data}
+              new_urls = {p["url"] for p in data}
+              old_overlap = len(old_urls & new_urls) / len(old_urls) if old_urls else 1.0
+              print(f"[INFO] Overlap with cached JSON: {old_overlap:.0%}", file=sys.stderr)
+              if old_overlap < 0.5:
+                  abort(f"New data shares only {old_overlap:.0%} URLs with cached JSON.")
+              compare_data = [{k: v for k, v in item.items() if k != "_src_url"} for item in data]
+              if data_hash(compare_data) == data_hash(old_data):
+                  print("[INFO] Data identical to cached JSON. Skipping build.", file=sys.stderr)
+                  set_env("SHOULD_SAVE_CACHE", "false")
+                  set_env("SHOULD_BUILD", "false")
+                  set_output("should_build", "false")
+                  sys.exit(0)
+              print("[INFO] Data changed, rebuilding.", file=sys.stderr)
+          else:
+              print("[INFO] No cached data found, proceeding with fresh data.", file=sys.stderr)
+          download_images(data)
+          for item in data:
+              item.pop("_src_url", None)
+          with open(old_path, "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print(f"[OK] _data/properties-api.json written ({len(data)} properties).", file=sys.stderr)
+          set_env("SHOULD_SAVE_CACHE", "true")
+          set_env("SHOULD_BUILD", "true")
+          set_output("should_build", "true")
+          EOF
+      - name: Save properties cache
+        if: env.SHOULD_SAVE_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            _data/properties-api.json
+            _assets/img/properties
+          key: properties-${{ github.run_id }}
+      - name: Cleanup old caches
+        if: env.SHOULD_SAVE_CACHE == 'true'
+        run: |
+          CURRENT_KEY="properties-${{ github.run_id }}"
+          gh cache list --json id,key --jq \
+            --arg key "$CURRENT_KEY" \
+            '.[] | select(.key != $key) | .id' | \
+            xargs -r -n1 gh cache delete
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Setup Pages
+        if: env.SHOULD_BUILD != 'false'
+        uses: actions/configure-pages@v5
+      - name: Build with Jekyll
+        if: env.SHOULD_BUILD != 'false'
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./
+          destination: ./_site
+      - name: Copy assets into _site
+        if: env.SHOULD_BUILD != 'false'
+        run: |
+          sudo mkdir -p _site/assets
+          [ -d "_assets" ] && sudo cp -r _assets/. _site/assets/ || true
+          [ -d "public" ] && sudo cp -r public/. _site/ || true
+          sudo chown -R "$USER":"$USER" _site/
+      - name: Upload artifact
+        if: env.SHOULD_BUILD != 'false'
+        uses: actions/upload-pages-artifact@v3
+  deploy:
+    if: needs.build.result == 'success' && needs.build.outputs.should_build == 'true'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
