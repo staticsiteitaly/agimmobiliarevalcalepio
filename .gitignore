@@ -1,0 +1,10 @@
+_data/properties-api.json
+_sass/vendor/
+_site/
+node_modules/
+.DS_Store
+.env
+Gemfile
+Gemfile.lock
+package-lock.json
+reload.json

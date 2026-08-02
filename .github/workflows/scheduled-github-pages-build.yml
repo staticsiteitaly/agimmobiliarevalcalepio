@@ -1,0 +1,158 @@
+name: Build and Deploy Site
+on:
+  workflow_dispatch:
+  push:
+    branches: ["master"]
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Scrape properties and generate JSON
+        run: |
+          mkdir -p _assets/img/properties _data
+          pip install Pillow requests beautifulsoup4 --break-system-packages --quiet
+          python3 << 'EOF'
+          import json, sys, io, requests, re
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          PAGE_HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+              "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+              "Accept-Encoding": "gzip, deflate, zstd",
+              "Cache-Control": "no-cache",
+              "Pragma": "no-cache",
+          }
+          IMAGE_HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+              "Referer": "https://www.agenziavalcalepio.it/",
+          }
+          r = requests.get("${{ secrets.WORKER_URL }}", headers=PAGE_HEADERS, timeout=30)
+          r.raise_for_status()
+          soup = BeautifulSoup(r.text, "html.parser")
+          data = []
+          boxes = soup.find_all("div", class_="dispbox")
+          if not boxes:
+              print("[ERROR] No property boxes found in HTML.", file=sys.stderr)
+              sys.exit(1)
+          for box in boxes:
+              img_tag = box.find("img", class_="homere")
+              img_url = img_tag["src"] if img_tag and "src" in img_tag.attrs else None
+              if img_url and not img_url.startswith("http"):
+                  img_url = "https://www.agenziavalcalepio.it/" + img_url.lstrip("/")
+              tit_div = box.find("div", class_="disp-tit")
+              if not tit_div:
+                  print("[ERROR] Missing title block in a property.", file=sys.stderr)
+                  sys.exit(1)
+              a_tag = tit_div.find("a")
+              if not a_tag:
+                  print("[ERROR] Missing title link in a property.", file=sys.stderr)
+                  sys.exit(1)
+              page_url = a_tag.get("href", "")
+              if page_url and not page_url.startswith("http"):
+                  page_url = "https://www.agenziavalcalepio.it/" + page_url.lstrip("/")
+              full_tit_text = a_tag.get_text(separator="|", strip=True)
+              parts = [p.strip() for p in full_tit_text.split("|") if p.strip()]
+              title = parts[0] if parts else ""
+              city = parts[1] if len(parts) > 1 else ""
+              if not (title and city and page_url):
+                  print(f"[ERROR] Missing required text fields: title={title!r} city={city!r} url={page_url!r}", file=sys.stderr)
+                  sys.exit(1)
+              dat_div = box.find("div", class_="disp-dat")
+              bed_val, bath_val, sqm_val = 0, 0, 0
+              if dat_div:
+                  bolds = [b.get_text(strip=True) for b in dat_div.find_all("b")]
+                  def safe_int(lst, idx):
+                      try: return int(lst[idx]) if lst[idx].isdigit() else 0
+                      except: return 0
+                  bed_val  = safe_int(bolds, 0)
+                  bath_val = safe_int(bolds, 1)
+                  sqm_val  = safe_int(bolds, 2)
+              foot_div = box.find("div", class_="disp-foot")
+              price = "Trattativa riservata"
+              if foot_div:
+                  price_text = foot_div.get_text(strip=True)
+                  m = re.search(r'[\d\.\,]+\s*\u20ac', price_text)
+                  if m:
+                      price = m.group(0).strip()
+              if not img_url:
+                  print(f"[ERROR] Missing image URL for property: {title} {city}", file=sys.stderr)
+                  sys.exit(1)
+              filename = img_url.split("/")[-1].split("?")[0]
+              local_img_path = f"/assets/img/properties/{filename}"
+              try:
+                  img_req = requests.get(img_url, headers=IMAGE_HEADERS, timeout=15)
+                  img_req.raise_for_status()
+                  img = Image.open(io.BytesIO(img_req.content)).convert("RGB")
+                  ratio = max(600 / img.width, 600 / img.height)
+                  new_w = int(img.width * ratio)
+                  new_h = int(img.height * ratio)
+                  img = img.resize((new_w, new_h), Image.LANCZOS)
+                  left = (new_w - 600) // 2
+                  top = (new_h - 600) // 2
+                  img = img.crop((left, top, left + 600, top + 600))
+                  img.save(f"_assets/img/properties/{filename}", "JPEG", quality=85)
+              except Exception as e:
+                  print(f"[ERROR] Failed to download/process image {img_url}: {e}", file=sys.stderr)
+                  sys.exit(1)
+              data.append({
+                  "title": title,
+                  "city": city,
+                  "zone": "",
+                  "url": page_url,
+                  "image": local_img_path,
+                  "price": price,
+                  "bed": f"{bed_val} {'camera' if bed_val == 1 else 'camere'}" if bed_val > 0 else "n/d",
+                  "bath": f"{bath_val} {'bagno' if bath_val == 1 else 'bagni'}" if bath_val > 0 else "n/d",
+                  "sqm": f"{sqm_val} m\u00b2" if sqm_val > 0 else "n/d",
+              })
+          if len(data) < 3:
+              print(f"[ERROR] Too few properties parsed ({len(data)}).", file=sys.stderr)
+              sys.exit(1)
+          with open("_data/properties-api.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print(f"[OK] {len(data)} properties written.", file=sys.stderr)
+          EOF
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./
+          destination: ./_site
+      - name: Copy assets into _site
+        run: |
+          sudo mkdir -p _site/assets
+          [ -d "_assets" ] && sudo cp -r _assets/. _site/assets/ || true
+          [ -d "public" ] && sudo cp -r public/. _site/ || true
+          sudo chown -R $USER:$USER _site
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+  deploy:
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Delete Old Workflow Runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 3
