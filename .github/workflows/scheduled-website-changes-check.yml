@@ -1,0 +1,88 @@
+name: Check Website Changes
+on:
+  schedule:
+    - cron: "0 12,19 * 11,12,1,2,3 *"
+    - cron: "0 11,18 * 4,5,6,7,8,9,10 *"
+    - cron: "0 23 31 12 *"
+  workflow_dispatch:
+permissions:
+  actions: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Restore previous hash
+        uses: actions/cache/restore@v4
+        with:
+          path: .last_hash
+          key: content-hash-${{ github.run_id }}
+          restore-keys: |
+            content-hash-
+      - name: Fetch and Check HTML
+        id: check_changes
+        run: |
+          pip install requests beautifulsoup4 --break-system-packages --quiet
+          python3 << 'EOF'
+          import sys, os, requests, hashlib
+          from datetime import datetime, timezone
+          from bs4 import BeautifulSoup
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+              "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+              "Accept-Encoding": "gzip, deflate, zstd",
+              "Cache-Control": "no-cache",
+              "Pragma": "no-cache",
+          }
+          r = requests.get("${{ secrets.WORKER_URL }}", headers=headers, timeout=30)
+          r.raise_for_status()
+          soup = BeautifulSoup(r.text, "html.parser")
+          boxes = soup.find_all("div", class_="dispbox")
+          if len(boxes) < 3:
+              sys.exit(1)
+          raw_content = "".join(b.get_text() for b in boxes)
+          curr_hash = hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
+          prev_hash = None
+          if os.path.exists(".last_hash"):
+              with open(".last_hash") as f:
+                  prev_hash = f.read().strip()
+          now = datetime.now(timezone.utc)
+          is_year_change = (now.month == 12 and now.day == 31 and now.hour == 23)
+          if curr_hash == prev_hash and not is_year_change:
+              sys.exit(0)
+          with open(".last_hash", "w") as f:
+              f.write(curr_hash)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("has_changes=true\n")
+          EOF
+      - name: Trigger Build Workflow
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          gh workflow run scheduled-github-pages-build.yml --ref ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Save current hash
+        if: steps.check_changes.outputs.has_changes == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .last_hash
+          key: content-hash-${{ github.run_id }}
+      - name: Cleanup old hash caches
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          CURRENT_KEY="content-hash-${{ github.run_id }}"
+          gh cache list --json id,key --jq \
+            "[.[] | select(.key != \"$CURRENT_KEY\" and (.key | startswith(\"content-hash-\")))] | .[].id" | \
+            xargs -r -n1 gh cache delete
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Delete Old Workflow Runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 3
