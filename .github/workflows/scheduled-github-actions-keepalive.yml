@@ -1,0 +1,37 @@
+name: Scheduled GitHub Actions Keepalive
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 0 1 * *'
+permissions:
+  actions: write
+concurrency:
+  group: 'keepalive'
+  cancel-in-progress: false
+jobs:
+  maintenance:
+    name: Run monthly maintenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Keep scheduled workflows alive
+        uses: PhrozenByte/gh-workflow-immortality@v1
+        with:
+          secret: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          repos: ${{ github.repository }}
+      - name: Rebuild site in January for copyright year
+        run: |
+          if [ "$(date -u +%m)" = "01" ]; then
+            gh workflow run github-pages-build.yml --repo ${{ github.repository }} --ref ${{ github.ref_name }}
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Delete old workflow runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: scheduled-github-actions-keepalive.yml
+          retain_days: 0
+          keep_minimum_runs: 3

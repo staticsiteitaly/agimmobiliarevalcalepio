@@ -1,0 +1,18 @@
+{
+  "title": "Immobili in Vendita",
+  "action": "Dettagli",
+  "messages": {
+    "error": "Non è stato possibile caricare gli annunci, riprova più tardi."
+  },
+  "more": {
+    "label": "Vedi Tutti",
+    "link": "https://agenziavalcalepio.it"
+  },
+  "pagination": {
+    "prev": "Precedente",
+    "next": "Successivo"
+  },
+  "aria": {
+    "label": "Navigazione Carosello"
+  }
+}

@@ -1,0 +1,93 @@
+name: GitHub Pages Build
+on:
+  workflow_dispatch:
+  push:
+    branches: ['master']
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+concurrency:
+  group: 'pages'
+  cancel-in-progress: false
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Fetch properties from Apify and generate JSON
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          APIFY_PROPERTIES_URL: ${{ secrets.APIFY_PROPERTIES_URL }}
+        run: |
+          mkdir -p _data
+          pip install requests --break-system-packages --quiet
+          python3 << 'EOF'
+          import json, os, sys, requests
+          r = requests.get(
+              os.environ["APIFY_PROPERTIES_URL"],
+              headers={"Authorization": "Bearer " + os.environ["APIFY_TOKEN"]},
+              timeout=30,
+          )
+          if not r.ok:
+              print(f"[ERROR] Apify request failed: HTTP {r.status_code} {r.text[:500]}")
+              sys.exit(1)
+          data = r.json()
+          if not isinstance(data, list) or len(data) < 3:
+              print(f"[ERROR] Expected at least 3 properties, got: {len(data) if isinstance(data, list) else type(data).__name__}")
+              sys.exit(1)
+          for index, item in enumerate(data, start=1):
+              missing = [k for k in ("title", "city", "url", "imageSource") if not item.get(k)]
+              if missing:
+                  print(f"[ERROR] Property {index} is incomplete: missing {missing}")
+                  sys.exit(1)
+          with open("_data/properties-api.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print(f"[OK] {len(data)} properties written")
+          EOF
+      - name: Set up Pages
+        uses: actions/configure-pages@v6
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./
+          destination: ./_site
+      - name: Copy assets into _site
+        run: |
+          sudo mkdir -p _site/assets
+          [ -d "_assets" ] && sudo cp -r _assets/. _site/assets/ || true
+          [ -d "public" ] && sudo cp -r public/. _site/ || true
+          sudo chown -R $USER:$USER _site
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v5
+  deploy:
+    name: Deploy site
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+  cleanup:
+    name: Clean up workflow runs
+    needs: [build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: github-pages-build.yml
+          retain_days: 0
+          keep_minimum_runs: 3
